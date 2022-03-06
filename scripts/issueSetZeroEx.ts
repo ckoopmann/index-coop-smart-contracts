@@ -51,6 +51,7 @@ async function decodeCallData(callData: string, proxyAddress: Address) {
     data: callData,
   });
   console.log("Called Function Signature: ", decodedTransaction.signature);
+  console.log("Args: ", decodedTransaction.args.map((arg: any) => arg.toString()));
 }
 
 async function getIssuanceQuotes(
@@ -65,12 +66,6 @@ async function getIssuanceQuotes(
 ): Promise<[string[], BigNumber]> {
   console.log("Getting issuance quotes");
   console.log("issuance module address:", issuanceModuleAddress);
-  const issuanceModule = await ethers.getContractAt("IBasicIssuanceModule", issuanceModuleAddress);
-  const result = await issuanceModule.getRequiredComponentUnitsForIssue(
-    setToken.address,
-    setAmount,
-  );
-  // console.log("result", result);
   const [components, positions] = await exchangeIssuance.getRequiredIssuanceComponents(
     issuanceModuleAddress,
     isDebtIssuance,
@@ -88,6 +83,8 @@ async function getIssuanceQuotes(
     const buyAmount = positions[index];
     const buyToken = component;
     const sellToken = inputTokenAddress;
+    console.log("buyToken:", buyToken);
+    console.log("buyAmount:", buyAmount.toString());
     if (ethers.utils.getAddress(buyToken) == ethers.utils.getAddress(sellToken)) {
       console.log("Component equal to input token skipping zero ex api call");
       positionQuotes.push(ethers.utils.formatBytes32String("FOOBAR"));
@@ -112,9 +109,23 @@ async function getIssuanceQuotes(
   return [positionQuotes, inputTokenAmount];
 }
 
+async function getComponentBalances(setToken: SetToken, exchangeIssuanceAddress: Address) {
+  const components = await setToken.getComponents();
+  const promises = components.map(async (component: Address) => {
+    const contract = await ethers.getContractAt("IERC20", component);
+    const balance = await contract.balanceOf(exchangeIssuanceAddress);
+    return {
+      component,
+      balance,
+    };
+  });
+  return await Promise.all(promises);
+}
+
 async function main() {
   const exchangeIssuanceAddress = "0xf42ecdc112365ff79a745b4cf7d4c266bd6e4b25";
 
+  const slippagePercents = 2;
   const setAddress = "0x2aF1dF3AB0ab157e1E2Ad8F88A7D04fbea0c7dc6"; // BED
   const issuanceModuleAddress = "0xd8EF3cACe8b4907117a45B0b125c68560532F94D"; // Basic Issuance
   const inputTokenAddress = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // WETH
@@ -130,7 +141,10 @@ async function main() {
   let signerToUse: Signer;
   if (process.env.USE_DEPLOYER) {
     console.log("USING DEPLOYER KEY");
-    signerToUse = new Wallet(process.env.PRODUCTION_MAINNET_DEPLOY_PRIVATE_KEY as string, ethers.provider);
+    signerToUse = new Wallet(
+      process.env.PRODUCTION_MAINNET_DEPLOY_PRIVATE_KEY as string,
+      ethers.provider,
+    );
   } else {
     console.log("using hardhat account");
     const signers = await ethers.getSigners();
@@ -151,7 +165,7 @@ async function main() {
     isDebtIssuance,
     inputTokenAddress,
     setAmount,
-    10,
+    slippagePercents,
   );
   console.log("IssuanceQuotes:", issuanceQuotes);
   console.log("InputAmount:", ethers.utils.formatEther(inputAmount));
@@ -198,6 +212,9 @@ async function main() {
     process.exit(1);
   }
 
+  console.log("Component balances before");
+  const balancesBefore = await getComponentBalances(setToken, exchangeIssuanceAddress);
+  console.log(balancesBefore);
   console.log("Issuing");
   const issueTx = await exchangeIssuanceContract
     .connect(signerToUse)
@@ -229,6 +246,30 @@ async function main() {
   const setBalanceAfter = await setToken.balanceOf(issuerAddress);
   console.log("setBalanceAfter", ethers.utils.formatUnits(setBalanceAfter, 18));
   console.log("setObtained", ethers.utils.formatUnits(setBalanceAfter.sub(setBalanceBefore), 18));
+
+  console.log("Component balances after");
+  const balancesAfter = await getComponentBalances(setToken, exchangeIssuanceAddress);
+  const [_, positions] = await exchangeIssuanceContract.getRequiredIssuanceComponents(
+    issuanceModuleAddress,
+    isDebtIssuance,
+    setToken.address,
+    setAmount,
+  );
+  const balanceDiff = balancesAfter.map((balanceAfter: any, i) => {
+    const balanceBefore = (balancesBefore[i] as any).balance;
+    const balanceDiff = balanceAfter.balance.sub(balanceBefore);
+    const component = balanceAfter.component;
+    return {
+      component,
+      balanceDiffWei: balanceDiff.toString(),
+      position: positions[i].toString(),
+      balanceDiffPercent: balanceDiff
+        .mul(100)
+        .div(positions[i])
+        .toString(),
+    };
+  });
+  console.log("balanceDiff", balanceDiff);
 }
 
 // We recommend this pattern to be able to use async/await everywhere
